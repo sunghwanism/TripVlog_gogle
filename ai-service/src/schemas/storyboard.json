@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TripVlog Storyboard",
+  "type": "object",
+  "required": ["project_id", "concept", "total_duration_seconds", "scenes", "metadata"],
+  "properties": {
+    "project_id": {
+      "type": "string",
+      "pattern": "^proj_[a-zA-Z0-9]+$"
+    },
+    "concept": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 500
+    },
+    "total_duration_seconds": {
+      "type": "number",
+      "minimum": 30,
+      "maximum": 600,
+      "description": "MUST be calculated via Python script, never manually"
+    },
+    "scenes": {
+      "type": "array",
+      "minItems": 3,
+      "items": {
+        "type": "object",
+        "required": [
+          "scene_id", "order", "source_files", "scene_type",
+          "location", "duration_seconds", "transition_type",
+          "transition_duration_ms", "emotion_tags", "quality_score"
+        ],
+        "properties": {
+          "scene_id": {
+            "type": "string",
+            "pattern": "^scene_[0-9]{3}$"
+          },
+          "order": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "source_files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1
+          },
+          "scene_type": {
+            "type": "string",
+            "enum": ["establishing", "action", "transition", "climax", "outro"]
+          },
+          "location": {
+            "type": "object",
+            "required": ["lat", "lng", "name"],
+            "properties": {
+              "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+              "lng": { "type": "number", "minimum": -180, "maximum": 180 },
+              "name": { "type": "string" }
+            }
+          },
+          "duration_seconds": {
+            "type": "number",
+            "minimum": 0.5,
+            "maximum": 30
+          },
+          "transition_type": {
+            "type": "string",
+            "enum": ["cut", "dissolve", "fade"]
+          },
+          "transition_duration_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3000
+          },
+          "emotion_tags": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "maxItems": 3
+          },
+          "quality_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 10
+          },
+          "caption": {
+            "type": "object",
+            "properties": {
+              "text": { "type": "string" },
+              "start_ms": { "type": "integer" },
+              "end_ms": { "type": "integer" },
+              "style": {
+                "type": "string",
+                "enum": ["minimal", "bold", "handwritten", "cinematic"]
+              }
+            }
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "created_at": { "type": "string", "format": "date-time" },
+        "gemini_model": { "type": "string" },
+        "analysis_version": { "type": "string" },
+        "total_media_items": { "type": "integer" },
+        "failed_items": { "type": "integer" },
+        "location_clusters": { "type": "integer" }
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+exifread==3.0.0
+python-xmp-toolkit==2.0.2
+ffprobe-python==1.0.3
+google-generativeai==0.3.2
+requests==2.31.0
+pytest==7.4.4
+pytest-asyncio==0.23.3
+httpx==0.26.0
+python-dotenv==1.0.0
