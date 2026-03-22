@@ -1,5 +1,7 @@
 # Agent Team Configuration
 
+Create a team called 'Gogle-Vlog-Team' with 6 parallel agents, then aggregate their findings into f'docs/{phase}/{agent_name}.md' for each phase.
+
 ## Agent 1 - FrontEngineer
 **Name:** 'front-engineer'
 **Model:** Opus
