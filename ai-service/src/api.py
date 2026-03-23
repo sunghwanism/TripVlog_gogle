@@ -1,15 +1,16 @@
 """
 AI Service FastAPI application.
 Endpoints:
-  POST /analyze      - Extract metadata from media files
-  POST /storyboard   - Run Gemini analysis + assemble storyboard JSON
+  POST /pipeline     - Full pipeline: Drive Agent → video description → storyboard
+  POST /analyze      - Extract metadata from media files (legacy)
+  POST /storyboard   - Gemini analysis + storyboard assembly (legacy)
   GET  /health       - Health check
 """
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clustering.gps_cluster import cluster_by_gps, compute_cluster_centroids
 from extractor.geocoding import reverse_geocode
@@ -17,11 +18,65 @@ from extractor.metadata import extract_metadata
 from gemini.analyzer import analyze_media_batch
 from gemini.validator import MediaBatch
 
-app = FastAPI(title='TripVlog AI Service', version='1.0.0')
+app = FastAPI(title='TripVlog AI Service', version='2.0.0')
 
 STORYBOARD_SCHEMA_PATH = Path(__file__).parent / 'schemas' / 'storyboard.json'
 QUALITY_GATE = 3.0  # Scenes below this score are excluded unless only footage for cluster
 
+
+# ── Pipeline (v2) ──────────────────────────────────────────────────────────────
+
+class PipelineRequest(BaseModel):
+    project_id: str
+    folder_name: str = Field(min_length=1, description="Google Drive folder name")
+    mood: str = Field(min_length=5, max_length=1000, description="Desired mood / atmosphere")
+
+
+@app.post('/pipeline')
+async def run_pipeline(req: PipelineRequest) -> dict:
+    """
+    v2 pipeline:
+      1. Drive Agent (Gemini Flash) → search folder → list video files
+      2. Build descriptions from Drive metadata (duration, resolution, filename)
+      3. All descriptions → Gemini Flash → ordered storyboard JSON
+
+    Note: per-video object analysis (Step 3 in original design) is not yet applied.
+    """
+    from drive.agent import list_videos_in_folder
+    from gemini.storyboard_gen import generate_storyboard
+    from gemini.video_describer import VideoDescription
+
+    # Step 1: Drive Agent
+    videos = list_videos_in_folder(req.folder_name)
+    if not videos:
+        raise HTTPException(
+            status_code=422,
+            detail=f"No video files found in Drive folder '{req.folder_name}'",
+        )
+
+    # Step 2: Build descriptions from Drive metadata (no download)
+    descriptions = [
+        VideoDescription(
+            file_id=v.file_id,
+            file_name=v.name,
+            duration_seconds=v.duration_seconds,
+            created_time=v.created_time,
+            gps_lat=v.gps_lat,
+            gps_lng=v.gps_lng,
+            camera_info=(
+                f"{v.camera_make or ''} {v.camera_model or ''}".strip() or None
+            ),
+            scene_description=f"Video clip: {v.name}",
+            mood="",
+        )
+        for v in videos
+    ]
+
+    # Step 3: Storyboard
+    return generate_storyboard(descriptions, req.mood, req.project_id)
+
+
+# ── Legacy endpoints (v1) ──────────────────────────────────────────────────────
 
 class AnalyzeRequest(BaseModel):
     project_id: str
