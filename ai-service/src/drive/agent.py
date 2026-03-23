@@ -4,9 +4,11 @@ Gemini orchestrates the entire folder search using two Drive tools:
   - search_drive_folder(name)   → returns matching folders
   - list_video_files(folder_id) → returns video files in a folder
 
+Auth: Web OAuth — tokens stored per user in TOKEN_DIR/{user_id}.json
+      Call GET /auth/drive/url?user_id=<id> to authorize a new user.
+
 Model: gemini-3.1-flash-lite-preview  (thinking=low, budget=512)
 """
-import json
 import logging
 import os
 from dataclasses import dataclass
@@ -15,48 +17,63 @@ from pathlib import Path
 import google.generativeai as genai
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 _SUPPORTED_VIDEO_MIME = frozenset({"video/mp4", "video/quicktime", "video/mov"})
-_DRIVE_MAX_AGENT_TURNS = 5  # safety limit on agentic loop iterations
+_DRIVE_MAX_AGENT_TURNS = 5
 
 # Model config
-## For Search Video
 _DRIVE_AGENT_MODEL = "gemini-3.1-flash-lite-preview"
 _THINKING_BUDGET_LOW = 512
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
 
-def build_drive_service():
-    """Build an authenticated Drive v3 service using OAuth2 desktop flow."""
-    secret_path = Path(
-        os.environ.get("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
+# ── Token storage ─────────────────────────────────────────────────────────────
+
+def _get_token_path(user_id: str) -> Path:
+    """Return per-user token path: TOKEN_DIR/{user_id}.json"""
+    token_dir = Path(
+        os.environ.get("TOKEN_DIR", "~/.tripvlog/tokens")
     ).expanduser().resolve()
+    return token_dir / f"{user_id}.json"
 
-    if not secret_path.exists():
-        raise FileNotFoundError(
-            f"client_secret.json not found at {secret_path}. "
-            "Set GOOGLE_CLIENT_SECRET_FILE env var."
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+class AuthRequiredError(Exception):
+    """Raised when no valid Drive token exists for a user."""
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(
+            f"User '{user_id}' is not authorized. "
+            f"Call GET /auth/drive/url?user_id={user_id} to start authorization."
         )
 
-    token_path = secret_path.parent / "token.json"
-    creds = None
 
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), _SCOPES)
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+def build_drive_service(user_id: str):
+    """
+    Build an authenticated Drive v3 service for user_id.
+    Loads TOKEN_DIR/{user_id}.json — refreshes silently if expired.
+    Raises AuthRequiredError if no valid token exists.
+    """
+    token_path = _get_token_path(user_id)
+
+    if not token_path.exists():
+        raise AuthRequiredError(user_id)
+
+    creds = Credentials.from_authorized_user_file(str(token_path), _SCOPES)
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+            logger.info("Token refreshed for user '%s'", user_id)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), _SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_path.write_text(creds.to_json())
-        logger.info("OAuth2 token saved to %s", token_path)
+            raise AuthRequiredError(user_id)
 
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -225,7 +242,7 @@ _DRIVE_TOOLS = genai.types.Tool(
 
 # ── Agentic loop ──────────────────────────────────────────────────────────────
 
-def _run_drive_agent(service, folder_name: str) -> list[dict]:
+def _run_drive_agent(service, folder_name: str, user_id: str) -> list[dict]:
     """
     Run the Gemini function-calling agent.
     Gemini decides when to call search_drive_folder and list_video_files.
@@ -295,14 +312,15 @@ def _run_drive_agent(service, folder_name: str) -> list[dict]:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def list_videos_in_folder(folder_name: str) -> list[VideoFile]:
+def list_videos_in_folder(folder_name: str, user_id: str) -> list[VideoFile]:
     """
     Drive Agent entry point.
     Gemini orchestrates folder search + video listing via function calling.
     Returns a list of VideoFile objects.
+    Raises AuthRequiredError if user_id has no valid token.
     """
-    service = build_drive_service()
-    raw_videos = _run_drive_agent(service, folder_name)
+    service = build_drive_service(user_id)
+    raw_videos = _run_drive_agent(service, folder_name, user_id)
 
     videos = [
         VideoFile(

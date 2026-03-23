@@ -1,15 +1,20 @@
 """
 AI Service FastAPI application.
 Endpoints:
-  POST /pipeline     - Full pipeline: Drive Agent → video description → storyboard
-  POST /analyze      - Extract metadata from media files (legacy)
-  POST /storyboard   - Gemini analysis + storyboard assembly (legacy)
-  GET  /health       - Health check
+  GET  /auth/drive/url       - Start web OAuth: returns Google consent URL
+  GET  /auth/drive/callback  - OAuth callback: exchanges code, saves per-user token
+  POST /pipeline             - Full pipeline: Drive Agent → descriptions → storyboard
+  POST /analyze              - Extract metadata from media files (legacy)
+  POST /storyboard           - Gemini analysis + storyboard assembly (legacy)
+  GET  /health               - Health check
 """
+import os
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
 from clustering.gps_cluster import cluster_by_gps, compute_cluster_centroids
@@ -20,6 +25,92 @@ from gemini.validator import MediaBatch
 
 app = FastAPI(title='TripVlog AI Service', version='2.0.0')
 
+# In-memory state store for CSRF (local dev).
+# Replace with Redis for production.
+_pending_states: dict[str, str] = {}  # state_token → user_id
+
+_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+
+def _client_secret_path() -> Path:
+    p = Path(
+        os.environ.get("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
+    ).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(
+            f"client_secret.json not found at {p}. "
+            "Set GOOGLE_CLIENT_SECRET_FILE env var."
+        )
+    return p
+
+
+def _redirect_uri() -> str:
+    return os.environ.get(
+        "GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/drive/callback"
+    )
+
+
+# ── OAuth endpoints ───────────────────────────────────────────────────────────
+
+@app.get('/auth/drive/url')
+async def auth_drive_url(user_id: str) -> dict:
+    """
+    Step 1 of web OAuth flow.
+    Returns a Google consent URL the user must open in their browser.
+    """
+    from google_auth_oauthlib.flow import Flow
+
+    flow = Flow.from_client_secrets_file(
+        str(_client_secret_path()),
+        scopes=_DRIVE_SCOPES,
+        redirect_uri=_redirect_uri(),
+    )
+    state = secrets.token_urlsafe(16)
+    _pending_states[state] = user_id
+
+    auth_url, _ = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        state=state,
+        prompt='consent',
+    )
+    return {"auth_url": auth_url, "user_id": user_id}
+
+
+@app.get('/auth/drive/callback')
+async def auth_drive_callback(code: str, state: str) -> HTMLResponse:
+    """
+    Step 2 of web OAuth flow.
+    Google redirects here with ?code=...&state=...
+    Exchanges the code for tokens and saves TOKEN_DIR/{user_id}.json.
+    """
+    from google_auth_oauthlib.flow import Flow
+    from drive.agent import _get_token_path
+
+    user_id = _pending_states.pop(state, None)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid or expired state parameter.")
+
+    flow = Flow.from_client_secrets_file(
+        str(_client_secret_path()),
+        scopes=_DRIVE_SCOPES,
+        redirect_uri=_redirect_uri(),
+        state=state,
+    )
+    flow.fetch_token(code=code)
+
+    token_path = _get_token_path(user_id)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(flow.credentials.to_json())
+
+    return HTMLResponse(
+        content=(
+            f"<h2>Authorization successful!</h2>"
+            f"<p>User <b>{user_id}</b> is now connected to Google Drive.</p>"
+            f"<p>You can close this tab and return to the demo.</p>"
+        )
+    )
+
 STORYBOARD_SCHEMA_PATH = Path(__file__).parent / 'schemas' / 'storyboard.json'
 QUALITY_GATE = 3.0  # Scenes below this score are excluded unless only footage for cluster
 
@@ -28,6 +119,7 @@ QUALITY_GATE = 3.0  # Scenes below this score are excluded unless only footage f
 
 class PipelineRequest(BaseModel):
     project_id: str
+    user_id: str = Field(min_length=1, description="User ID — must be authorized via /auth/drive/url")
     folder_name: str = Field(min_length=1, description="Google Drive folder name")
     mood: str = Field(min_length=5, max_length=1000, description="Desired mood / atmosphere")
 
@@ -42,12 +134,22 @@ async def run_pipeline(req: PipelineRequest) -> dict:
 
     Note: per-video object analysis (Step 3 in original design) is not yet applied.
     """
-    from drive.agent import list_videos_in_folder
+    from drive.agent import AuthRequiredError, list_videos_in_folder
     from gemini.storyboard_gen import generate_storyboard
     from gemini.video_describer import VideoDescription
 
     # Step 1: Drive Agent
-    videos = list_videos_in_folder(req.folder_name)
+    try:
+        videos = list_videos_in_folder(req.folder_name, req.user_id)
+    except AuthRequiredError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "message": str(exc),
+                "auth_url": f"/auth/drive/url?user_id={req.user_id}",
+            },
+        )
+
     if not videos:
         raise HTTPException(
             status_code=422,
