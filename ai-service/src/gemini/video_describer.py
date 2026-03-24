@@ -2,7 +2,7 @@
 Video Description Generator.
 Downloads each Drive video to a temp file, uploads to Gemini File API,
 and generates a structured description (objects, scene, mood, key moments).
-Model: gemini-1.5-flash (cheapest model supporting video via File API)
+Model: gemini-3.1-flash-lite-preview (cheapest model supporting video via File API)
 """
 import json
 import logging
@@ -11,7 +11,8 @@ import tempfile
 import time
 from pathlib import Path
 
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types
 from googleapiclient.http import MediaIoBaseDownload
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024   # 200 MB — skip above this
 _POLL_INTERVAL_SECS = 5
 _POLL_TIMEOUT_SECS = 180
+
+_DESCRIBER_MODEL = "gemini-3.1-flash-lite-preview"
+_THINKING_BUDGET=2048
 
 _DESCRIPTION_PROMPT = """Analyze this video and return a JSON object with exactly these fields:
 {
@@ -53,9 +57,9 @@ class VideoDescription(BaseModel):
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _download_to_temp(file_id: str, dest: Path) -> None:
+def _download_to_temp(file_id: str, dest: Path, user_id: str) -> None:
     """Stream a Drive file into dest using 8 MB chunks."""
-    service = build_drive_service()
+    service = build_drive_service(user_id)
     request = service.files().get_media(fileId=file_id)
 
     with open(dest, "wb") as fh:
@@ -65,12 +69,12 @@ def _download_to_temp(file_id: str, dest: Path) -> None:
             _, done = downloader.next_chunk()
 
 
-def _upload_and_wait(local_path: Path, mime_type: str):
+def _upload_and_wait(client: genai.Client, local_path: Path, mime_type: str):
     """
     Upload a local video to Gemini File API and wait until state == ACTIVE.
     Returns the ready Gemini File object.
     """
-    video_file = genai.upload_file(path=str(local_path), mime_type=mime_type)
+    video_file = client.files.upload(file=str(local_path), config={'mime_type': mime_type})
 
     elapsed = 0
     while video_file.state.name == "PROCESSING":
@@ -80,7 +84,7 @@ def _upload_and_wait(local_path: Path, mime_type: str):
             )
         time.sleep(_POLL_INTERVAL_SECS)
         elapsed += _POLL_INTERVAL_SECS
-        video_file = genai.get_file(video_file.name)
+        video_file = client.files.get(name=video_file.name)
 
     if video_file.state.name == "FAILED":
         raise RuntimeError(f"Gemini File API failed to process {local_path.name}")
@@ -111,7 +115,7 @@ def _fallback_description(video: VideoFile) -> VideoDescription:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def describe_video(video: VideoFile) -> VideoDescription:
+def describe_video(video: VideoFile, user_id: str) -> VideoDescription:
     """
     Analyze a Drive video using Gemini File API.
     Steps:
@@ -125,7 +129,7 @@ def describe_video(video: VideoFile) -> VideoDescription:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not configured")
 
-    genai.configure(api_key=api_key)
+    client = genai.Client(api_key=api_key)
 
     size_mb = video.size_bytes / 1024 / 1024
     if video.size_bytes > _MAX_DOWNLOAD_BYTES:
@@ -146,13 +150,21 @@ def describe_video(video: VideoFile) -> VideoDescription:
             tmp_path = Path(tmp.name)
 
         logger.info("Downloading '%s' (%.1f MB)...", video.name, size_mb)
-        _download_to_temp(video.file_id, tmp_path)
+        _download_to_temp(video.file_id, tmp_path, user_id)
 
         logger.info("Uploading '%s' to Gemini File API...", video.name)
-        gemini_file = _upload_and_wait(tmp_path, video.mime_type)
+        gemini_file = _upload_and_wait(client, tmp_path, video.mime_type)
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content([gemini_file, _DESCRIPTION_PROMPT])
+        response = client.models.generate_content(
+                    model=_DESCRIBER_MODEL,
+                    contents=[gemini_file, _DESCRIPTION_PROMPT],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.8,
+                        thinking_config=types.ThinkingConfig(thinking_level="medium",
+                            include_thoughts=True,)
+                    )
+                )
 
         parsed = _parse_json_response(response.text)
 
@@ -176,6 +188,6 @@ def describe_video(video: VideoFile) -> VideoDescription:
             tmp_path.unlink(missing_ok=True)
         if gemini_file is not None:
             try:
-                genai.delete_file(gemini_file.name)
+                client.files.delete(name=gemini_file.name)
             except Exception:
                 pass

@@ -3,13 +3,13 @@
 Phase 01 PoC Demo — TripVlog AI Pipeline v2
 ============================================
 Flow:
-  1. Drive Agent  (gemini-3.1-flash-lite-preview, thinking=low)
+  1. Drive Agent  (gemini-3.1-flash-lite-preview, thinking=None)
      → function-calling agent searches Drive folder, lists video files
 
-  2. Build descriptions from Drive metadata
-     (per-video object analysis will be added in a later phase)
+  2. Build descriptions (gemini-3.1-flash-lite-preview, thinking=low)
+     → per-video object analysis JSON
 
-  3. Storyboard generator  (gemini-2.5-flash, thinking=medium)
+  3. Storyboard generator  (gemini-3.1-flash-lite-preview, thinking=medium)
      → ordered storyboard JSON
 
 Auth: Web OAuth (multi-user).
@@ -208,9 +208,9 @@ def run_demo() -> None:
     print(f"  Project     : {cfg['project_id']}")
     print(f"  Mood        : {cfg['mood'][:72]}{'…' if len(cfg['mood']) > 72 else ''}")
     print()
-    print(f"  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=low,    budget=512)")
-    print(f"  Step 2  Descriptions  : Drive metadata only (no download)")
-    print(f"  Step 3  Storyboard    : gemini-2.5-flash                (thinking=medium, budget=8192)")
+    print(f"  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=None,   budget=None)")
+    print(f"  Step 2  Descriptions  : gemini-3.1-flash-lite-preview  (hinking=low,     budget=2048)")
+    print(f"  Step 3  Storyboard    : gemini-3.1-flash-lite-preview  (thinking=medium, budget=8192)")
 
     # Ensure this user is authorized before hitting the pipeline
     _section("Authorization Check")

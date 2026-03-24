@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from clustering.gps_cluster import cluster_by_gps, compute_cluster_centroids
 from extractor.geocoding import reverse_geocode
 from extractor.metadata import extract_metadata
-from gemini.analyzer import analyze_media_batch
+# from gemini.analyzer import analyze_media_batch
 from gemini.validator import MediaBatch
 
 app = FastAPI(title='TripVlog AI Service', version='2.0.0')
@@ -129,14 +129,12 @@ async def run_pipeline(req: PipelineRequest) -> dict:
     """
     v2 pipeline:
       1. Drive Agent (Gemini Flash) → search folder → list video files
-      2. Build descriptions from Drive metadata (duration, resolution, filename)
+      2. Analyze each video with Gemini File API → objects, scene, mood, key moments
       3. All descriptions → Gemini Flash → ordered storyboard JSON
-
-    Note: per-video object analysis (Step 3 in original design) is not yet applied.
     """
     from drive.agent import AuthRequiredError, list_videos_in_folder
     from gemini.storyboard_gen import generate_storyboard
-    from gemini.video_describer import VideoDescription
+    from gemini.video_describer import VideoDescription, describe_video
 
     # Step 1: Drive Agent
     try:
@@ -156,23 +154,18 @@ async def run_pipeline(req: PipelineRequest) -> dict:
             detail=f"No video files found in Drive folder '{req.folder_name}'",
         )
 
-    # Step 2: Build descriptions from Drive metadata (no download)
-    descriptions = [
-        VideoDescription(
-            file_id=v.file_id,
-            file_name=v.name,
-            duration_seconds=v.duration_seconds,
-            created_time=v.created_time,
-            gps_lat=v.gps_lat,
-            gps_lng=v.gps_lng,
-            camera_info=(
+    # Step 2: Analyze each video with Gemini File API
+    descriptions = []
+    for v in videos:
+        desc = describe_video(v, req.user_id)
+        descriptions.append(desc.model_copy(update={
+            "created_time": v.created_time,
+            "gps_lat": v.gps_lat,
+            "gps_lng": v.gps_lng,
+            "camera_info": (
                 f"{v.camera_make or ''} {v.camera_model or ''}".strip() or None
             ),
-            scene_description=f"Video clip: {v.name}",
-            mood="",
-        )
-        for v in videos
-    ]
+        }))
 
     # Step 3: Storyboard
     return generate_storyboard(descriptions, req.mood, req.project_id)
@@ -184,80 +177,59 @@ class AnalyzeRequest(BaseModel):
     project_id: str
     files: list[dict]  # [{file_path, drive_file_id, mime_type}]
 
+# @app.post('/storyboard')
+# async def generate_storyboard(batch: MediaBatch) -> dict:
+#     """Run Gemini analysis and assemble validated storyboard JSON."""
+#     # 1. Run Gemini analysis
+#     scene_analyses = analyze_media_batch(batch)
 
-@app.post('/analyze')
-async def analyze_files(req: AnalyzeRequest) -> dict:
-    """Extract EXIF/XMP/ffprobe metadata and geocode GPS coordinates."""
-    results = []
-    for f in req.files:
-        meta = extract_metadata(f['file_path'], f['mime_type'])
+#     if not scene_analyses:
+#         raise HTTPException(status_code=422, detail='Gemini analysis returned no results')
 
-        location_name = 'Unknown Location'
-        if meta.get('gps_lat') and meta.get('gps_lng'):
-            location_name = reverse_geocode(meta['gps_lat'], meta['gps_lng'])
+#     # 2. GPS clustering on media items
+#     items_with_meta = [item.model_dump() for item in batch.media_items]
+#     clustered_items = cluster_by_gps(items_with_meta)
+#     centroids = compute_cluster_centroids(clustered_items)
 
-        results.append({
-            'drive_file_id': f['drive_file_id'],
-            'location_name': location_name,
-            **meta,
-        })
+#     # 3. Build item -> cluster map
+#     item_cluster = {
+#         item['file_id']: item.get('cluster_id', -1)
+#         for item in clustered_items
+#     }
 
-    return {'project_id': req.project_id, 'results': results}
+#     # 4. Count items per cluster for quality gate decisions
+#     cluster_counts: dict[int, int] = {}
+#     for cid in item_cluster.values():
+#         cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
 
+#     # 5. Assemble scenes — apply quality gate
+#     scenes = _assemble_scenes(scene_analyses, batch, item_cluster, cluster_counts, centroids)
 
-@app.post('/storyboard')
-async def generate_storyboard(batch: MediaBatch) -> dict:
-    """Run Gemini analysis and assemble validated storyboard JSON."""
-    # 1. Run Gemini analysis
-    scene_analyses = analyze_media_batch(batch)
+#     if len(scenes) < 3:
+#         raise HTTPException(
+#             status_code=422,
+#             detail=f'Insufficient scenes after quality gate: {len(scenes)}',
+#         )
 
-    if not scene_analyses:
-        raise HTTPException(status_code=422, detail='Gemini analysis returned no results')
+#     # 6. Calculate total_duration via Python (never LLM math)
+#     total_duration = _calculate_total_duration(scenes)
 
-    # 2. GPS clustering on media items
-    items_with_meta = [item.model_dump() for item in batch.media_items]
-    clustered_items = cluster_by_gps(items_with_meta)
-    centroids = compute_cluster_centroids(clustered_items)
+#     storyboard = {
+#         'project_id': batch.project_id,
+#         'concept': batch.concept_prompt[:500],
+#         'total_duration_seconds': total_duration,
+#         'scenes': scenes,
+#         'metadata': {
+#             'created_at': datetime.now(timezone.utc).isoformat(),
+#             'gemini_model': 'gemini-3.1-flash-lite-preview',
+#             'analysis_version': '1.0.0',
+#             'total_media_items': len(batch.media_items),
+#             'failed_items': len(batch.media_items) - len(scene_analyses),
+#             'location_clusters': len(centroids),
+#         },
+#     }
 
-    # 3. Build item -> cluster map
-    item_cluster = {
-        item['file_id']: item.get('cluster_id', -1)
-        for item in clustered_items
-    }
-
-    # 4. Count items per cluster for quality gate decisions
-    cluster_counts: dict[int, int] = {}
-    for cid in item_cluster.values():
-        cluster_counts[cid] = cluster_counts.get(cid, 0) + 1
-
-    # 5. Assemble scenes — apply quality gate
-    scenes = _assemble_scenes(scene_analyses, batch, item_cluster, cluster_counts, centroids)
-
-    if len(scenes) < 3:
-        raise HTTPException(
-            status_code=422,
-            detail=f'Insufficient scenes after quality gate: {len(scenes)}',
-        )
-
-    # 6. Calculate total_duration via Python (never LLM math)
-    total_duration = _calculate_total_duration(scenes)
-
-    storyboard = {
-        'project_id': batch.project_id,
-        'concept': batch.concept_prompt[:500],
-        'total_duration_seconds': total_duration,
-        'scenes': scenes,
-        'metadata': {
-            'created_at': datetime.now(timezone.utc).isoformat(),
-            'gemini_model': 'gemini-1.5-pro',
-            'analysis_version': '1.0.0',
-            'total_media_items': len(batch.media_items),
-            'failed_items': len(batch.media_items) - len(scene_analyses),
-            'location_clusters': len(centroids),
-        },
-    }
-
-    return storyboard
+#     return storyboard
 
 
 def _assemble_scenes(

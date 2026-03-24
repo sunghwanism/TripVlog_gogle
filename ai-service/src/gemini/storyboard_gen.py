@@ -9,14 +9,15 @@ import os
 import time
 from datetime import datetime, timezone
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 from .video_describer import VideoDescription
 
 logger = logging.getLogger(__name__)
 
 # Model used for storyboard generation — Flash model with medium thinking
-_STORYBOARD_MODEL = "gemini-2.5-flash"
+_STORYBOARD_MODEL = "gemini-3.1-flash-lite-preview"
 _THINKING_BUDGET_MEDIUM = 8192   # medium thinking level → balanced quality/cost
 
 _SYSTEM_PROMPT = """You are a professional travel vlog editor creating cinematic storyboards.
@@ -124,7 +125,6 @@ def _build_scenes(raw_scenes: list[dict], descriptions: list[VideoDescription]) 
 
     return scenes
 
-
 def _calculate_total_duration(scenes: list[dict]) -> float:
     """Python-calculated total duration — no LLM math."""
     scene_total = sum(s["duration_seconds"] for s in scenes)
@@ -145,25 +145,29 @@ def generate_storyboard(
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not configured")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=_STORYBOARD_MODEL,
-        system_instruction=_SYSTEM_PROMPT,
-    )
-    thinking_config = genai.GenerationConfig(
-        thinking_config=genai.types.ThinkingConfig(
-            thinking_budget=_THINKING_BUDGET_MEDIUM
-        )
-    )
-
+    client = genai.Client(api_key=api_key)
     user_prompt = _build_user_prompt(descriptions, mood)
     raw_scenes: list[dict] = []
 
     for attempt in range(3):
         try:
-            response = model.generate_content(user_prompt, generation_config=thinking_config)
+            response = client.models.generate_content(
+                model=_STORYBOARD_MODEL,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=_SYSTEM_PROMPT,
+                    thinking_config=types.ThinkingConfig(
+                        include_thoughts=True,
+                        thinking_level="medium"
+                    ),
+                    response_mime_type="application/json",
+                    temperature=0.7,
+                )
+            )
+
             raw_scenes = _parse_raw(response.text)
             break
+            
         except Exception as exc:
             wait = 2 ** attempt
             logger.warning("Storyboard generation attempt %d failed: %s", attempt, exc)
@@ -171,11 +175,25 @@ def generate_storyboard(
                 time.sleep(wait)
             else:
                 raise RuntimeError("Storyboard generation failed after 3 attempts") from exc
-
+    print('-------------------------')
+    print('[Raw_scenes]')
+    print(raw_scenes)
+    print('-------------------------')
     scenes = _build_scenes(raw_scenes, descriptions)
+    print('-------------------------')
+    print('[Scenes]')
+    print(scenes)
+    print('-------------------------')
     total_duration = _calculate_total_duration(scenes)
-    unique_locations = {d.location_hint for d in descriptions if d.location_hint != "Unknown"}
-
+    print('-------------------------')
+    print('[Total_duration]')
+    print(total_duration)
+    print('-------------------------')
+    unique_locations = {d.location_hint for d in descriptions if d.location_hint and d.location_hint != "Unknown"}
+    print('-------------------------')
+    print('[Unique_locations]')
+    print(unique_locations)
+    print('-------------------------')
     return {
         "project_id": project_id,
         "concept": mood[:500],
@@ -190,3 +208,4 @@ def generate_storyboard(
             "location_clusters": len(unique_locations),
         },
     }
+
