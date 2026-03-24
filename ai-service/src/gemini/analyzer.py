@@ -23,7 +23,7 @@ def _get_client() -> genai.GenerativeModel:
         raise RuntimeError('GEMINI_API_KEY not configured')
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        model_name='gemini-1.5-pro',
+        model_name='gemini-1.5-flash',
         system_instruction=SYSTEM_PROMPT,
     )
 
