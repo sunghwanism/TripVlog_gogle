@@ -6,7 +6,7 @@
 USER_ID + DRIVE_FOLDER_NAME + MOOD + GEMINI_API_KEY
         │
         ▼
-[Auth]  Web OAuth  (multi-user)
+[Auth]  Web OAuth  (google-auth-oauthlib)
    └─ first run → browser opens → Google consent → TOKEN_DIR/{user_id}.json saved
    └─ subsequent runs → token loaded silently, refreshed if expired
         │
@@ -16,18 +16,28 @@ USER_ID + DRIVE_FOLDER_NAME + MOOD + GEMINI_API_KEY
    └─ returns: file_id, name, duration, resolution, GPS, camera, created_time
         │
         ▼
-② Build Descriptions from Drive metadata
-   └─ no file download required
-   └─ per-video object analysis → added in a later phase
+② Analyze each video with Gemini File API  (gemini-3.1-flash-lite-preview, thinking=low, budget=2048)
+   └─ downloads video → uploads to Gemini File API → objects, scene, mood, key moments
+   └─ Drive metadata (GPS, camera, created_time) merged into description
+   └─ files >200 MB are skipped with a fallback description
         │
         ▼
-③ Storyboard Generator  (gemini-2.5-flash, thinking=medium, budget=8192)
+③ Storyboard Generator  (gemini-3.1-flash-lite-preview, thinking=medium, budget=8192)
    └─ ordered scenes with captions, transitions, emotion tags
    └─ Python-calculated total duration (no LLM math)
         │
         ▼
    Storyboard JSON
 ```
+
+---
+
+## Auth: How It Works
+
+- **Library**: `google-auth-oauthlib` (no custom OAuth logic)
+- **Token storage**: local JSON file per user — `TOKEN_DIR/{user_id}.json` (default: `~/.tripvlog/tokens/`)
+- **No database required** — tokens persist on disk and are refreshed automatically when expired
+- **Callback**: a one-shot local HTTP server on port 8765 handles the Google redirect
 
 ---
 
@@ -41,21 +51,10 @@ USER_ID + DRIVE_FOLDER_NAME + MOOD + GEMINI_API_KEY
 4. Add Authorized redirect URI: `http://localhost:8765/auth/drive/callback`
 5. Download `client_secret.json` → place it anywhere (path passed via env var)
 
-### 2. Start Infrastructure
+### 2. Install Dependencies
 
 ```bash
-cd /Users/dalssung/Desktop/project/TripVlog_gogle
-docker compose up -d
-```
-
-### 3. Install Dependencies
-
-```bash
-# AI Service
 cd ai-service && pip install -r requirements.txt
-
-# macOS optional (for future object analysis phase)
-brew install ffmpeg
 ```
 
 ---
@@ -68,7 +67,7 @@ brew install ffmpeg
 |----------|-------------|
 | `GOOGLE_CLIENT_SECRET_FILE` | Path to `client_secret.json` from GCP Console |
 | `DRIVE_FOLDER_NAME` | Name of the Google Drive folder containing videos |
-| `GEMINI_API_KEY` | Required for Drive Agent + storyboard generation |
+| `GEMINI_API_KEY` | Required for all Gemini steps |
 
 ### Optional env vars
 
@@ -90,21 +89,14 @@ GEMINI_API_KEY=your-key \
 python demo.py
 ```
 
-### Multi-user example
+### Custom mood example
 
 ```bash
-# Authorize and run as alice
 USER_ID=alice \
 GOOGLE_CLIENT_SECRET_FILE=~/client_secret.json \
-DRIVE_FOLDER_NAME="Alice Trip 2025" \
+DRIVE_FOLDER_NAME="Vlog_Sample" \
 GEMINI_API_KEY=your-key \
-python demo.py
-
-# Authorize and run as bob (separate token stored automatically)
-USER_ID=bob \
-GOOGLE_CLIENT_SECRET_FILE=~/client_secret.json \
-DRIVE_FOLDER_NAME="Bob Road Trip" \
-GEMINI_API_KEY=your-key \
+MOOD="열심히 자기개발 하는 나" \
 python demo.py
 ```
 
@@ -127,31 +119,6 @@ Subsequent runs skip the browser entirely and load the saved token silently.
 
 ---
 
-## API Endpoints (when running as a server)
-
-If you run `uvicorn api:app --port 8000` instead of the demo script, the OAuth flow uses the server endpoints:
-
-```bash
-# Step 1 — get consent URL
-curl "http://localhost:8000/auth/drive/url?user_id=alice"
-# → { "auth_url": "https://accounts.google.com/...", "user_id": "alice" }
-
-# Step 2 — open auth_url in browser → Google redirects to /auth/drive/callback
-# → token saved automatically
-
-# Step 3 — run pipeline
-curl -X POST http://localhost:8000/pipeline \
-  -H "Content-Type: application/json" \
-  -d '{
-    "project_id": "proj-001",
-    "user_id": "alice",
-    "folder_name": "Alice Trip 2025",
-    "mood": "Serene and cinematic, golden hour vibes"
-  }'
-```
-
----
-
 ## Expected Output
 
 ```
@@ -160,10 +127,10 @@ curl -X POST http://localhost:8000/pipeline \
 ════════════════════════════════════════════════════════════════
   Credentials : /Users/.../client_secret.json
   User ID     : alice
-  Folder      : Korea Trip 2025
-  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=low,    budget=512)
-  Step 2  Descriptions  : Drive metadata only (no download)
-  Step 3  Storyboard    : gemini-2.5-flash                (thinking=medium, budget=8192)
+  Folder      : Vlog_Sample
+  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=None,   budget=None)
+  Step 2  Descriptions  : gemini-3.1-flash-lite-preview  (thinking=low,    budget=2048)
+  Step 3  Storyboard    : gemini-3.1-flash-lite-preview  (thinking=medium, budget=8192)
 
 ════════════════════════════════════════════════════════════════
   Authorization Check
@@ -173,7 +140,7 @@ curl -X POST http://localhost:8000/pipeline \
 ════════════════════════════════════════════════════════════════
   POST /pipeline
 ════════════════════════════════════════════════════════════════
-  Searching Drive for folder: 'Korea Trip 2025'...
+  Searching Drive for folder: 'Vlog_Sample'...
 
   ... storyboard JSON ...
 
@@ -182,14 +149,17 @@ curl -X POST http://localhost:8000/pipeline \
 ════════════════════════════════════════════════════════════════
   Project ID        : poc-phase1-001
   User ID           : alice
-  Total duration    : 28.5s
-  Scenes            : 5
+  Total duration    : 23.3s
+  Scenes            : 3
+  Videos analyzed   : 3
+  Failed items      : 0
+  Location clusters : 3
   ...
   ID           Type           Dur    Trans       Caption
   ──────────── ────────────── ─────  ──────────  ──────────────────────────────────────────────────
-  scene_000    establishing    5.0s  dissolve    Han River at golden hour — Seoul glows at dusk
-  scene_001    action          3.0s  cut         Weaving through the busy streets of Myeongdong
-  ...
+  scene_000    establishing   10.0s  fade        Starting the day with a journey toward growth.
+  scene_001    action          6.1s  cut         Setting the stage for deep work.
+  scene_002    climax          6.2s  cut         Every small step counts towards my goals.
 ```
 
 ---
