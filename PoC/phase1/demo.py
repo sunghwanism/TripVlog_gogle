@@ -3,32 +3,37 @@
 Phase 01 PoC Demo — TripVlog AI Pipeline v2
 ============================================
 Flow:
-  1. Drive Agent  (gemini-3.1-flash-lite-preview, thinking=low)
+  1. Drive Agent  (gemini-3.1-flash-lite-preview, thinking=None)
      → function-calling agent searches Drive folder, lists video files
-     → returns: file_id, name, duration, resolution, GPS, camera, created_time
 
-  2. Build descriptions from Drive metadata
-     (per-video object analysis will be added in a later phase)
+  2. Build descriptions (gemini-3.1-flash-lite-preview, thinking=low)
+     → per-video object analysis JSON
 
-  3. Storyboard generator  (gemini-2.5-flash, thinking=medium)
-     → ordered storyboard JSON with scenes, captions, transitions
+  3. Storyboard generator  (gemini-3.1-flash-lite-preview, thinking=medium)
+     → ordered storyboard JSON
+
+Auth: Web OAuth (multi-user).
+  - First run for a user: opens browser → Google consent → token saved to TOKEN_DIR/{user_id}.json
+  - Subsequent runs: token loaded silently, refreshed if expired.
 
 Required env vars:
     GOOGLE_CLIENT_SECRET_FILE   Path to client_secret.json from GCP Console
                                 (default: <repo-root>/client_secret.json)
     DRIVE_FOLDER_NAME           Name of the Drive folder containing videos
     GEMINI_API_KEY              Required for Drive Agent + storyboard generation
+    USER_ID                     Identifier for this user (default: demo-user)
 
 Optional env vars:
-    MOOD        Desired mood / atmosphere for the storyboard
-                (default: "A cinematic travel story capturing the journey and landscapes")
-    PROJECT_ID  Project identifier (default: poc-phase1-001)
+    TOKEN_DIR     Token storage directory (default: ~/.tripvlog/tokens)
+    MOOD          Desired mood / atmosphere for the storyboard
+    PROJECT_ID    Project identifier (default: poc-phase1-001)
 
 Usage:
     cd PoC/phase1
     GOOGLE_CLIENT_SECRET_FILE=~/client_secret.json \\
     DRIVE_FOLDER_NAME="My Trip Videos" \\
     GEMINI_API_KEY=your-key \\
+    USER_ID=alice \\
     python demo.py
 """
 
@@ -36,9 +41,12 @@ import asyncio
 import json
 import os
 import sys
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
-# Resolve ai-service/src so bare imports (drive.agent, gemini.*, api) work
+# Resolve ai-service/src so bare imports work
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "ai-service" / "src"))
 
@@ -55,7 +63,7 @@ def _json(data: dict) -> None:
     print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
-# ── Config validation ─────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
 def _load_config() -> dict:
     secret_env = os.environ.get("GOOGLE_CLIENT_SECRET_FILE")
@@ -67,6 +75,7 @@ def _load_config() -> dict:
 
     folder_name = os.environ.get("DRIVE_FOLDER_NAME", "").strip()
     gemini_key  = os.environ.get("GEMINI_API_KEY", "").strip()
+    user_id     = os.environ.get("USER_ID", "demo-user").strip()
     mood        = os.environ.get(
         "MOOD",
         "A cinematic travel story capturing the journey and landscapes.",
@@ -100,9 +109,88 @@ def _load_config() -> dict:
         "client_secret": client_secret,
         "folder_name": folder_name,
         "gemini_key": gemini_key,
+        "user_id": user_id,
         "mood": mood,
         "project_id": project_id,
     }
+
+
+# ── Demo OAuth helper (web flow via temporary local server) ───────────────────
+
+def _ensure_authorized(user_id: str, client_secret: Path, callback_port: int = 8765) -> None:
+    """
+    Ensures user_id has a valid token in TOKEN_DIR.
+    If not, runs a one-shot local HTTP server to handle the web OAuth callback.
+    This mirrors what the real server's /auth/drive/url + /auth/drive/callback do.
+    """
+    from drive.agent import _get_token_path
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import Flow
+
+    token_path = _get_token_path(user_id)
+
+    # Check existing token
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path))
+        if creds.valid:
+            print(f"  [auth] Token found for '{user_id}' — authorized.")
+            return
+        if creds.expired and creds.refresh_token:
+            from google.auth.transport.requests import Request
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+            print(f"  [auth] Token refreshed for '{user_id}'.")
+            return
+
+    # No valid token — run web OAuth flow with a temporary callback server
+    redirect_uri = f"http://localhost:{callback_port}/auth/drive/callback"
+
+    flow = Flow.from_client_secrets_file(
+        str(client_secret),
+        scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        redirect_uri=redirect_uri,
+    )
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+    )
+
+    received: dict = {}
+
+    class _CallbackHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            params = parse_qs(urlparse(self.path).query)
+            received["code"] = (params.get("code") or [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(
+                b"<h2>Authorization successful!</h2>"
+                b"<p>You can close this tab and return to the terminal.</p>"
+            )
+
+        def log_message(self, *args):
+            pass  # suppress server access logs
+
+    print(f"\n  [auth] No token found for user '{user_id}'.")
+    print(f"  [auth] Opening browser for Google Drive authorization...")
+    print(f"  [auth] If browser doesn't open, visit:\n  {auth_url}\n")
+    webbrowser.open(auth_url)
+
+    server = HTTPServer(("localhost", callback_port), _CallbackHandler)
+    server.timeout = 120
+    server.handle_request()  # blocks until callback arrives
+
+    code = received.get("code")
+    if not code:
+        print("\n[error] Authorization timed out or was denied.")
+        sys.exit(1)
+
+    flow.fetch_token(code=code)
+
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(flow.credentials.to_json())
+    print(f"  [auth] Token saved → {token_path}")
 
 
 # ── Main demo ─────────────────────────────────────────────────────────────────
@@ -115,32 +203,41 @@ def run_demo() -> None:
 
     _section("TripVlog Phase 01 — PoC Demo")
     print(f"  Credentials : {cfg['client_secret']}")
+    print(f"  User ID     : {cfg['user_id']}")
     print(f"  Folder      : {cfg['folder_name']}")
     print(f"  Project     : {cfg['project_id']}")
     print(f"  Mood        : {cfg['mood'][:72]}{'…' if len(cfg['mood']) > 72 else ''}")
     print()
-    print(f"  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=low,    budget=512)")
-    print(f"  Step 2  Descriptions  : Drive metadata only (no download)")
-    print(f"  Step 3  Storyboard    : gemini-2.5-flash                (thinking=medium, budget=8192)")
+    print(f"  Step 1  Drive Agent   : gemini-3.1-flash-lite-preview  (thinking=None,   budget=None)")
+    print(f"  Step 2  Descriptions  : gemini-3.1-flash-lite-preview  (hinking=low,     budget=2048)")
+    print(f"  Step 3  Storyboard    : gemini-3.1-flash-lite-preview  (thinking=medium, budget=8192)")
+
+    # Ensure this user is authorized before hitting the pipeline
+    _section("Authorization Check")
+    _ensure_authorized(cfg["user_id"], cfg["client_secret"])
 
     async def _run() -> None:
         transport = ASGITransport(app=app)  # type: ignore[arg-type]
         async with AsyncClient(transport=transport, base_url="http://test") as client:
 
-            # ── POST /pipeline ─────────────────────────────────────────────────
             _section("POST /pipeline")
             print(f"  Searching Drive for folder: '{cfg['folder_name']}'...")
-            print("  (browser will open on first run for Google OAuth consent)")
 
             r = await client.post(
                 "/pipeline",
                 json={
                     "project_id": cfg["project_id"],
+                    "user_id": cfg["user_id"],
                     "folder_name": cfg["folder_name"],
                     "mood": cfg["mood"],
                 },
                 timeout=600.0,
             )
+
+            if r.status_code == 401:
+                detail = r.json().get("detail", {})
+                print(f"\n[error] Not authorized: {detail.get('message', r.text)}")
+                sys.exit(1)
 
             if r.status_code != 200:
                 print(f"\n[error] /pipeline returned {r.status_code}:")
@@ -152,30 +249,14 @@ def run_demo() -> None:
 
             storyboard = r.json()
 
-            # ── Raw storyboard JSON ────────────────────────────────────────────
             _section("Storyboard JSON")
             _json(storyboard)
 
-            # ── Video metadata table ───────────────────────────────────────────
-            _section("Video Files (from Drive Agent)")
-            scenes = storyboard.get("scenes", [])
-            if scenes:
-                print(f"  {'file_id':<28}  {'name':<35}  {'dur':>6}  GPS")
-                print(f"  {'─'*28}  {'─'*35}  {'─'*6}  {'─'*24}")
-                for s in scenes:
-                    fid = (s["source_files"] or ["—"])[0]
-                    loc = s.get("location", {})
-                    lat = loc.get("lat")
-                    lng = loc.get("lng")
-                    gps_str = f"{lat:.4f}, {lng:.4f}" if lat else "—"
-                    dur_str = f"{s['duration_seconds']:.1f}s"
-                    # file name not stored in storyboard scenes, show file_id only
-                    print(f"  {fid:<28}  {'(see JSON above)':<35}  {dur_str:>6}  {gps_str}")
-
-            # ── Summary table ──────────────────────────────────────────────────
             _section("Storyboard Summary")
             meta = storyboard["metadata"]
+            scenes = storyboard.get("scenes", [])
             print(f"  Project ID        : {storyboard['project_id']}")
+            print(f"  User ID           : {cfg['user_id']}")
             print(f"  Total duration    : {storyboard['total_duration_seconds']}s")
             print(f"  Scenes            : {len(scenes)}")
             print(f"  Videos analyzed   : {meta['total_media_items']}")

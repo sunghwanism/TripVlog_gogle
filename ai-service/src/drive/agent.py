@@ -4,59 +4,75 @@ Gemini orchestrates the entire folder search using two Drive tools:
   - search_drive_folder(name)   → returns matching folders
   - list_video_files(folder_id) → returns video files in a folder
 
+Auth: Web OAuth — tokens stored per user in TOKEN_DIR/{user_id}.json
+      Call GET /auth/drive/url?user_id=<id> to authorize a new user.
+
 Model: gemini-3.1-flash-lite-preview  (thinking=low, budget=512)
 """
-import json
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
 _SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 _SUPPORTED_VIDEO_MIME = frozenset({"video/mp4", "video/quicktime", "video/mov"})
-_DRIVE_MAX_AGENT_TURNS = 5  # safety limit on agentic loop iterations
+_DRIVE_MAX_AGENT_TURNS = 5
 
 # Model config
-## For Search Video
 _DRIVE_AGENT_MODEL = "gemini-3.1-flash-lite-preview"
 _THINKING_BUDGET_LOW = 512
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
+# ── Token storage ─────────────────────────────────────────────────────────────
 
-def build_drive_service():
-    """Build an authenticated Drive v3 service using OAuth2 desktop flow."""
-    secret_path = Path(
-        os.environ.get("GOOGLE_CLIENT_SECRET_FILE", "client_secret.json")
+def _get_token_path(user_id: str) -> Path:
+    """Return per-user token path: TOKEN_DIR/{user_id}.json"""
+    token_dir = Path(
+        os.environ.get("TOKEN_DIR", "~/.tripvlog/tokens")
     ).expanduser().resolve()
+    return token_dir / f"{user_id}.json"
 
-    if not secret_path.exists():
-        raise FileNotFoundError(
-            f"client_secret.json not found at {secret_path}. "
-            "Set GOOGLE_CLIENT_SECRET_FILE env var."
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+class AuthRequiredError(Exception):
+    """Raised when no valid Drive token exists for a user."""
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+        super().__init__(
+            f"User '{user_id}' is not authorized. "
+            f"Call GET /auth/drive/url?user_id={user_id} to start authorization."
         )
 
-    token_path = secret_path.parent / "token.json"
-    creds = None
 
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), _SCOPES)
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+def build_drive_service(user_id: str):
+    """
+    Build an authenticated Drive v3 service for user_id.
+    Loads TOKEN_DIR/{user_id}.json — refreshes silently if expired.
+    Raises AuthRequiredError if no valid token exists.
+    """
+    token_path = _get_token_path(user_id)
+
+    if not token_path.exists():
+        raise AuthRequiredError(user_id)
+
+    creds = Credentials.from_authorized_user_file(str(token_path), _SCOPES)
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+            logger.info("Token refreshed for user '%s'", user_id)
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(secret_path), _SCOPES)
-            creds = flow.run_local_server(port=0)
-        token_path.write_text(creds.to_json())
-        logger.info("OAuth2 token saved to %s", token_path)
+            raise AuthRequiredError(user_id)
 
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
@@ -183,41 +199,41 @@ def _dispatch(service, name: str, args: dict) -> dict:
 
 # ── Gemini tool schema ────────────────────────────────────────────────────────
 
-_DRIVE_TOOLS = genai.types.Tool(
+_DRIVE_TOOLS = types.Tool(
     function_declarations=[
-        genai.types.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="search_drive_folder",
             description=(
                 "Search Google Drive for folders whose name matches the given string. "
                 "Returns a list of folders with id, name, and createdTime."
             ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "The folder name to search for",
-                    }
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "name": types.Schema(
+                        type="STRING",
+                        description="The folder name to search for",
+                    )
                 },
-                "required": ["name"],
-            },
+                required=["name"],
+            ),
         ),
-        genai.types.FunctionDeclaration(
+        types.FunctionDeclaration(
             name="list_video_files",
             description=(
                 "List all video files (mp4, mov) inside a Google Drive folder. "
                 "Returns file id, name, mime_type, size, duration, and resolution."
             ),
-            parameters={
-                "type": "object",
-                "properties": {
-                    "folder_id": {
-                        "type": "string",
-                        "description": "The Google Drive folder ID",
-                    }
+            parameters=types.Schema(
+                type="OBJECT",
+                properties={
+                    "folder_id": types.Schema(
+                        type="STRING",
+                        description="The Google Drive folder ID",
+                    )
                 },
-                "required": ["folder_id"],
-            },
+                required=["folder_id"],
+            ),
         ),
     ]
 )
@@ -225,7 +241,7 @@ _DRIVE_TOOLS = genai.types.Tool(
 
 # ── Agentic loop ──────────────────────────────────────────────────────────────
 
-def _run_drive_agent(service, folder_name: str) -> list[dict]:
+def _run_drive_agent(service, folder_name: str, user_id: str) -> list[dict]:
     """
     Run the Gemini function-calling agent.
     Gemini decides when to call search_drive_folder and list_video_files.
@@ -235,92 +251,111 @@ def _run_drive_agent(service, folder_name: str) -> list[dict]:
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not configured")
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_name=_DRIVE_AGENT_MODEL,
-        tools=[_DRIVE_TOOLS],
-        generation_config=genai.GenerationConfig(
-            thinking_config=genai.types.ThinkingConfig(
-                thinking_budget=_THINKING_BUDGET_LOW
-            )
-        ),
+    # 1. init Client
+    client = genai.Client(api_key=api_key)
+
+    # 2. Make Chat Object
+    chat = client.chats.create(
+        model=_DRIVE_AGENT_MODEL,
+        config=types.GenerateContentConfig(
+            tools=[_DRIVE_TOOLS],
+            thinking_config=types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_level='low'
+            ),
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False)
+        )
     )
 
-    chat = model.start_chat()
     response = chat.send_message(
-        f"Find the Google Drive folder named '{folder_name}' and list all video files in it. "
-        f"Use the search_drive_folder tool first, then list_video_files on the chosen folder."
+        message=(
+            f"Find the Google Drive folder named '{folder_name}' and list all video files in it. "
+            f"Use the search_drive_folder tool first, then list_video_files on the chosen folder."
+        )
     )
+    print("================================================================")
+    print("**Debugging in src.drive.agent.py**")
+    for part in response.candidates[0].content.parts:
+        if part.text:
+            print(f"[Response]: {part.text}")
+        
+        if part.thought:
+            print(f"[Thinking]: {part.thought}")
+        
+        if part.function_call:
+            print(f"[Function Call]: {part.function_call.name}({part.function_call.args})")
 
-    collected_videos: list[dict] = []
+    print("================================================================")
+    collected_videos = []
 
     for turn in range(_DRIVE_MAX_AGENT_TURNS):
-        # Collect all function calls from this response
         fn_calls = [
-            p.function_call
-            for p in response.parts
-            if hasattr(p, "function_call") and p.function_call.name
+            part.function_call 
+            for part in response.candidates[0].content.parts 
+            if part.function_call
         ]
 
         if not fn_calls:
-            # No more tool calls — agent is done
             logger.info("Drive Agent finished after %d turn(s)", turn + 1)
             break
 
-        # Execute each tool and build function-response parts
         response_parts = []
         for fn_call in fn_calls:
-            args = dict(fn_call.args)
+            args = fn_call.args 
             logger.info("Drive Agent calling tool: %s(%s)", fn_call.name, args)
-
             tool_result = _dispatch(service, fn_call.name, args)
 
-            # Track video results for our return value
             if fn_call.name == "list_video_files":
                 collected_videos = tool_result.get("videos", [])
 
             response_parts.append(
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
+                types.Part(
+                    function_response=types.FunctionResponse(
                         name=fn_call.name,
                         response=tool_result,
                     )
                 )
             )
 
-        response = chat.send_message(response_parts)
+        response = chat.send_message(message=response_parts)
 
     return collected_videos
 
-
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def list_videos_in_folder(folder_name: str) -> list[VideoFile]:
+def list_videos_in_folder(folder_name: str, user_id: str) -> list[VideoFile]:
     """
-    Drive Agent entry point.
-    Gemini orchestrates folder search + video listing via function calling.
-    Returns a list of VideoFile objects.
+    Drive Agent Entry Point.
     """
-    service = build_drive_service()
-    raw_videos = _run_drive_agent(service, folder_name)
+    # Run Agent
+    service = build_drive_service(user_id) # Google Drive Servie build(drive, v3, ...)
+    raw_videos = _run_drive_agent(service, folder_name, user_id)
 
-    videos = [
-        VideoFile(
-            file_id=v["file_id"],
-            name=v["name"],
-            mime_type=v["mime_type"],
-            size_bytes=v["size_bytes"],
-            duration_seconds=v["duration_ms"] / 1000.0 if v["duration_ms"] else None,
-            width=v.get("width"),
-            height=v.get("height"),
-            created_time=v.get("created_time"),
-            gps_lat=v.get("gps_lat"),
-            gps_lng=v.get("gps_lng"),
-            camera_make=v.get("camera_make"),
-            camera_model=v.get("camera_model"),
-        )
-        for v in raw_videos
-    ]
+    if not raw_videos:
+        logger.warning("No videos found by Drive Agent for folder: %s", folder_name)
+        return []
+
+    videos = []
+    for v in raw_videos:
+        try:
+            video = VideoFile(
+                file_id=v.get("file_id", ""),
+                name=v.get("name", "unnamed_video"),
+                mime_type=v.get("mime_type", "video/mp4"),
+                size_bytes=int(v.get("size_bytes", 0)),
+                duration_seconds=float(v["duration_ms"]) / 1000.0 if v.get("duration_ms") else None,
+                width=v.get("width"),
+                height=v.get("height"),
+                created_time=v.get("created_time"),
+                gps_lat=v.get("gps_lat"),
+                gps_lng=v.get("gps_lng"),
+                camera_make=v.get("camera_make"),
+                camera_model=v.get("camera_model"),
+            )
+            videos.append(video)
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error("Failed to parse video data: %s, Error: %s", v, e)
+            continue
 
     logger.info("Drive Agent returned %d video file(s)", len(videos))
     return videos
